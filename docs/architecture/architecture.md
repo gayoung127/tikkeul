@@ -28,6 +28,48 @@
 
 > 선택 근거: [ADR-0001 모듈러 모놀리스 아키텍처 선택](../decisions/ADR-0001-modular-monolith.md)
 
+#### 시스템 조감도
+
+```mermaid
+graph TB
+    Client["Client<br/>(REST API / WebSocket)"]
+
+    subgraph APP["APPLICATION LAYER"]
+        direction LR
+        A_member["member<br/>Controller · Service · DTO"]
+        A_wallet["wallet<br/>Controller · Service · DTO"]
+        A_trading["trading<br/>Controller · Service · DTO"]
+        A_transfer["transfer<br/>Controller · Service · DTO"]
+        A_market["market<br/>Controller · Service · DTO"]
+    end
+
+    subgraph DOM["DOMAIN LAYER"]
+        direction LR
+        D_member["Member<br/>MemberSecurity"]
+        D_wallet["Wallet · Balance<br/>BalanceHistory"]
+        D_trading["Order · Trade<br/>OrderBook"]
+        D_transfer["Transaction<br/>BankAccount"]
+        D_market["Coin · Market"]
+    end
+
+    subgraph SYS["SYSTEM LAYER"]
+        direction LR
+        S_config["Config"]
+        S_security["Security"]
+        S_jpa["JPA Impl"]
+        S_redis["Redis Client"]
+    end
+
+    MySQL[("MySQL 8.0+<br/>영속 데이터")]
+    Redis[("Redis<br/>캐시 · 토큰")]
+
+    Client --> APP
+    APP --> DOM
+    SYS --> DOM
+    SYS --> MySQL
+    SYS --> Redis
+```
+
 ### 1.2 아키텍처 목표
 
 | 목표 | 설명 |
@@ -101,6 +143,41 @@ application ──────► domain ◄────── system
 - application과 system은 domain에 의존한다
 - application은 system의 설정/유틸만 사용한다
 
+#### 요청 흐름도
+
+일반적인 쓰기 요청이 레이어를 관통하는 경로를 보여준다.
+
+```mermaid
+graph TB
+    Client["Client"]
+
+    subgraph application ["application 레이어"]
+        Controller["Controller<br/><i>요청 검증, DTO 변환</i>"]
+        Service["Service<br/><i>유스케이스 오케스트레이션</i><br/><i>@Transactional 경계</i>"]
+    end
+
+    subgraph domain ["domain 레이어"]
+        Entity["Entity<br/><i>비즈니스 규칙 검증 (불변식)</i><br/><i>상태 변경: balance.lock()</i>"]
+        Repository["Repository (인터페이스)"]
+    end
+
+    subgraph system ["system 레이어"]
+        RepoImpl["JPA 구현체<br/><i>dirty checking / save()</i>"]
+    end
+
+    DB[("MySQL / Redis")]
+
+    Client -- "HTTP Request (JSON)" --> Controller
+    Controller --> Service
+    Service --> Entity
+    Service -- "다른 컨텍스트 Service 호출" --> Service
+    Entity --> Repository
+    Repository --> RepoImpl
+    RepoImpl --> DB
+```
+
+**핵심 규칙**: 비즈니스 규칙은 반드시 Entity(domain)에서 실행되고, Service(application)는 이를 조합만 한다.
+
 ### 2.3 도메인 경계
 
 #### 바운디드 컨텍스트
@@ -115,25 +192,28 @@ application ──────► domain ◄────── system
 
 #### 컨텍스트 간 관계
 
+```mermaid
+graph TB
+    member["<b>member</b><br/>사용자 식별<br/>거래 가능 상태"]
+
+    trading["<b>trading</b><br/>주문 · 매칭 · 체결"]
+    wallet["<b>wallet</b><br/>잔고 · 원장 · 정산"]
+    transfer["<b>transfer</b><br/>입출금"]
+    market["<b>market</b><br/>코인 · 마켓 메타데이터"]
+
+    member -- "인증된 사용자 (memberId)" --> trading
+    member -- "인증된 사용자 (memberId)" --> wallet
+    member -- "인증된 사용자 (memberId)" --> transfer
+
+    trading -- "잔액 락/해제, 체결 정산" --> wallet
+    transfer -- "잔액 변경" --> wallet
+    trading -- "마켓/코인 정보 조회" --> market
 ```
-        ┌──────────┐
-        │  member  │
-        └────┬─────┘
-             │ 인증된 사용자
-             ▼
-┌──────────────────────────────────────┐
-│                                      │
-▼                                      ▼
-┌──────────┐    잔액 락/정산    ┌──────────┐
-│ trading  │◄──────────────────►│  wallet  │
-└────┬─────┘                    └────▲─────┘
-     │                               │
-     │ 마켓 정보 조회                  │ 잔액 변경
-     ▼                               │
-┌──────────┐                   ┌─────┴────┐
-│  market  │                   │ transfer │
-└──────────┘                   └──────────┘
-```
+
+**의존 방향** (호출하는 쪽 → 호출받는 쪽):
+- `trading → wallet` : 주문 시 잔액 락, 체결 시 정산
+- `trading → market` : 마켓/코인 메타데이터 조회
+- `transfer → wallet` : 입출금 시 잔액 변경
 
 #### 컨텍스트 간 통신 규칙
 
@@ -239,7 +319,83 @@ public Order createOrder(OrderRequest request) {
 | Test | JUnit5 + Mockito | | |
 | Message Queue | — | 현재 미사용 | 확장 시 Kafka/RabbitMQ 고려 |
 
-### 4.2 확장 시 고려할 수 있는 방향
+### 4.2 인프라 배포 구성
+
+Docker Compose 기반으로 로컬 개발 및 배포 환경을 구성한다.
+추후 AWS/클라우드 배포 시에도 동일한 컨테이너 구성을 유지한다.
+
+#### 로컬 / Docker Compose
+
+```mermaid
+graph TB
+    Client["Client(Browser)"]
+
+    subgraph docker ["Docker Compose"]
+        Nginx["Nginx:80 / :443리버스 프록시"]
+        Frontend["Frontend(React 등):3000"]
+        SpringBoot["Spring Boot:8080백엔드 API"]
+        DB[("MySQL:3306")]
+        Redis[("Redis:6379")]
+    end
+
+    Client -- "① 페이지 요청" --> Nginx
+    Nginx -- "/ → :3000" --> Frontend
+    Frontend -. "② API 호출 (fetch)" .-> Nginx
+    Nginx -- "/api/** → :8080" --> SpringBoot
+    SpringBoot --> DB
+    SpringBoot --> Redis
+```
+
+**요청 흐름**: Client → Nginx → Frontend(페이지 로드) → 브라우저에서 API 호출 → Nginx → Spring Boot
+
+| 컨테이너 | 역할 | 포트 | 네트워크 |
+|----------|------|------|---------|
+| **nginx** | 리버스 프록시, TLS 종단 | 80, 443 (외부 노출) | frontend, backend |
+| **frontend** | 프론트엔드 (React 등) | 3000 (내부) | frontend |
+| **app** | Spring Boot API 서버 | 8080 (내부) | backend |
+| **db** | MySQL | 3306 (내부) | backend |
+| **redis** | Redis (캐시, 토큰) | 6379 (내부) | backend |
+
+#### 클라우드 배포 (향후)
+
+```mermaid
+graph TB
+    Client["Client"]
+    Frontend["Frontend(Vercel / S3+CloudFront)"]
+
+    subgraph AWS ["AWS Cloud"]
+        subgraph VPC
+            subgraph pub ["Public Subnet"]
+                Nginx["Nginx + Certbot:443 / :80"]
+                SpringBoot["Spring Boot:8080"]
+            end
+            subgraph priv ["Private Subnet"]
+                DB[("MySQL")]
+                Redis[("Redis")]
+            end
+        end
+    end
+
+    Client -- "① 페이지 요청" --> Frontend
+    Frontend -. "② API 호출" .-> Nginx
+    Nginx --> SpringBoot
+    SpringBoot --> DB
+    SpringBoot --> Redis
+```
+
+Docker Compose → 클라우드 전환 시 변경점:
+
+| 항목 | Docker Compose | AWS 배포 |
+|------|---------------|---------|
+| DB | 컨테이너 | RDS 또는 Private Subnet EC2 |
+| Redis | 컨테이너 | ElastiCache 또는 Private Subnet EC2 |
+| TLS | 로컬에서는 불필요 | Certbot + Nginx 또는 ALB |
+| Frontend | 컨테이너 | Vercel 또는 S3+CloudFront |
+
+> draw.io로 상세 인프라 다이어그램을 별도 작성할 수 있다.
+> AWS 아이콘 라이브러리: draw.io → File → Open Library → AWS 선택
+
+### 4.3 확장 시 고려할 수 있는 방향
 
 현재는 단일 애플리케이션, 동기 처리, 단일 DB로 운영한다.
 트래픽이나 조직 규모가 커질 경우 아래 방향을 고려할 수 있다.
@@ -247,7 +403,7 @@ public Order createOrder(OrderRequest request) {
 - **이벤트 기반 전환**: 주문 → 매칭 → 정산 → 알림을 비동기 파이프라인으로 분리. 메시지 큐 도입.
 - **서비스 분리**: 컨텍스트 단위로 독립 서비스 분리. DB 분리, SAGA 패턴.
 
-### 4.3 MSA 전환 기준
+### 4.4 MSA 전환 기준
 
 | 기준 | 설명 |
 |------|------|
@@ -255,6 +411,6 @@ public Order createOrder(OrderRequest request) {
 | 팀 규모 확대 | 독립 배포 필요 |
 | 기술 스택 다양화 | 컨텍스트별 다른 기술 필요 |
 
-### 4.4 전환 방법 (Strangler Fig Pattern)
+### 4.5 전환 방법 (Strangler Fig Pattern)
 
 가장 독립적인 컨텍스트부터 분리 (예: market) → API Gateway로 라우팅 → 점진적으로 다른 컨텍스트 분리
